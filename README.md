@@ -16,6 +16,7 @@ A simple app to extract transaction data from Credit Karma so it can be imported
 
 2. Create a `.env` file in the root directory of the app and add the token to it like this:
 ```
+# .env
 token = '<insert_bearer_token_here>'
 ```
 3. From the CLI, execute `python ck-extract.py` and the script will download your transactions history to 'transactions.csv'
