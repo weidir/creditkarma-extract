@@ -1,20 +1,23 @@
 # Import required libraries
 import json
-import os
+from datetime import datetime
 import requests
+from dotenv import dotenv_values
 import pandas as pd
 
 # Set the base URL for the CreditKarma GraphQL API
 base_url = 'https://api.creditkarma.com/graphql'
 
 
-def get_transactions(after_cursor=None) -> pd.DataFrame:
+def post_request(query: str, token: str, after_cursor=None) -> requests.Response:
     """
     Function to get list of transactions from CreditKarma GraphQL API
     Parameters:
+        query (str): The GraphQL query to get the data
+        token (str): The bearer access token to authenticate the request
         after_cursor (str): The cursor to get the next page of transactions
     Returns:
-        pd.DataFrame: A DataFrame containing the transactions data in tabular form
+        requests.Response: The response from the API
     """
 
     # Define variables for the GraphQL query
@@ -34,110 +37,105 @@ def get_transactions(after_cursor=None) -> pd.DataFrame:
         }
     }
 
-    # Define the GraphQL query
-    params = {
-        "query": "Your GraphQL query here",
-        'variables': variables,
-    }
+    # Add the variables to the query
+    query['variables'] = variables
 
     # Set the headers for the request
     headers = {
-        'Authorization': f"Bearer {os.getenv('MY_ACCESS_TOKEN')}",
+        'Authorization': f"Bearer {token}",
         'Content-Type': 'application/json',
     }
 
     # Make a POST request to the CreditKarma GraphQL API
-    response = requests.post('https://api.creditkarma.com/graphql', json=params, headers=headers)
+    response = requests.post('https://api.creditkarma.com/graphql', json=query, headers=headers)
 
     # Check if the request was successful
     if response.status_code != 200:
         if response.status_code == 401:
-            print(os.getenv('HELP_MESSAGE'))
-            obfuscated = os.getenv('MY_ACCESS_TOKEN')
-            if obfuscated and len(obfuscated) > 10:
-                obfuscated = f"{obfuscated[:6]}...{obfuscated[-5:]}"
-            print(f"401, either MY_ACCESS_TOKEN ({obfuscated}) was invalid or needs refresh")
-            print("MY_ACCESS_TOKEN: should look like eyJra...kA2Uh  It'll be pretty long, the ... is just to shorten it for this message")
+            
+            if token and len(token) > 10:
+                short_token = f"{token[:6]}...{token[-5:]}"
+            print(f"401 error response, either token ({short_token}) was invalid or needs refresh")
         
-        raise Exception(f"error: {response.status_code} body: {response.text}")
+        raise Exception(f"Response code: {response.status_code} Response body: {response.text}")
     
-    # Parse the response JSON
+    return response
+
+
+def extract_transactions() -> pd.DataFrame:
+    """
+    Function to extract all transactions for an account from CreditKarma GraphQL API
+    """
+
+    # Load environment variables from .env file
+    env_vars = dotenv_values('.env')
+    token = env_vars['token']
+
+    # Load the JSON query to extract transactions
+    with open('transactions_query.json', 'r') as f:
+        query = json.load(f)
+
+    # Perform the first request to get the first page of transactions
+    response = post_request(query=query, token=token)
     response_json = response.json()
-    print(f"CreditKarma GraphQL response: {response_json}")
-    return response_json
+
+    # Load the transactions data from the response into a DataFrame
+    trans_df = pd.json_normalize(response_json['data']['prime']['transactionsHub']['transactionPage']['transactions'])
+
+    # Determine if there are more pages of transactions
+    has_next_page = response_json['data']['prime']['transactionsHub']['transactionPage']['pageInfo']['hasNextPage']
+    if not has_next_page:
+        print("No more pages of transactions")
+        return trans_df
+
+    # Get the cursor for the next page of transactions
+    end_cursor = response_json['data']['prime']['transactionsHub']['transactionPage']['pageInfo']['endCursor']
+
+    # Loop through the pages of transactions until there are no more pages
+    ix = 0
+    while has_next_page:
+
+        # Perform the next request to get the next page of transactions
+        response_next = post_request(query=query, token=token, after_cursor=end_cursor)
+        response_next_json = response_next.json()
+
+        # Load the transactions data from the response into a DataFrame
+        trans_df_next = pd.json_normalize(response_next_json['data']['prime']['transactionsHub']['transactionPage']['transactions'])
+
+        # Append the most recent page of transactions to the DataFrame
+        trans_df = pd.concat([trans_df, trans_df_next], axis=0, ignore_index=True)
+
+        # Extract the cursor and next page flag for the next page of transactions
+        page_info = response_next_json['data']['prime']['transactionsHub']['transactionPage']['pageInfo']
+        end_cursor = page_info['endCursor']
+        has_next_page = page_info['hasNextPage']
+
+        # Print the number of transactions extracted
+        print(f"Transactions page {ix+1} extracted - Has next page: {has_next_page}")
+        ix += 1
+
+    return trans_df
 
 
-def main() -> pd.DataFrame:
+def main() -> None:
     """
-    Main function of this script to recursively get all transactions from CreditKarma GraphQL API
+    Main function to extract transactions from CreditKarma GraphQL API
     """
 
-    # Initialize variables for data extraction and pagination
-    total_transactions = []
-    has_next_page = True
-    cursor = os.getenv('START_CURSOR')
+    # Capture the start time of the script
+    start_tmstp = datetime.now()
 
-    with open("creditkarma_transactions.csv", "a") as out_file_csv, open("creditkarma_transactions.json", "a") as out_file_full_json:
-        if os.stat("creditkarma_transactions.csv").st_size == 0:
-            out_file_csv.write('"Date","Description","Original Description","Amount","Transaction Type","Category","Account Name","Labels","Notes"\n')
+    # Extract the transactions from the CreditKarma API
+    trans_df = extract_transactions()
+    print(f"Transactions extracted: {trans_df.shape[0]:,}")
 
-        while has_next_page:
-            if cursor:
-                print(f"getting next page cursor: {cursor}")
-            resp = get_transactions(cursor)
-            resp_data = resp.get('data', {}).get('prime', {}).get('transactionsHub', {}).get('transactionPage', {}).get('transactions')
+    # Save the transactions to a CSV file
+    trans_df.to_csv('transactions.csv', index=False)
 
-            if not resp_data:
-                print(f"expected data not in response: \n\n{resp}")
-                print("If your response looks like \n\n")
-                print('{"data":{"prime":{"transactionsHub":{}}}}')
-                print("then you probably need to re-authenticate on the website by visiting https://www.creditkarma.com/networth/transaction to get a mobile code.")
-
-            tra_batch = []
-            for tra in resp_data:
-                out_file_full_json.write(json.dumps(tra) + "\n")
-
-                desc = tra['description']
-                date = tra['date']
-                status = tra['status']
-
-                tra_type = 'debit' if tra['amount']['value'] < 0 else 'credit'
-                amt = abs(tra['amount']['value'])
-
-                acct = tra.get('account', {}).get('name')
-                if not acct:
-                    print(f"not sure why, but missing account name from the transaction: \n\n{tra}\n\n")
-                cat = tra.get('category', {}).get('name')
-                if not cat:
-                    print(f"not sure why, but missing category name from the transaction: \n\n{tra}\n\n")
-                merch = tra.get('merchant', {}).get('name')
-                if not merch:
-                    print(f"not sure why, but missing merchant name from the transaction: \n\n{tra}\n\n")
-
-                out_file_csv.write(f'"{date}","{merch}","{desc}","{amt}","{tra_type}","{cat}","{acct}","",""\n')
-
-                new_tra = {
-                    'desc': desc,
-                    'date': date,
-                    'status': status,
-                    'amt': amt,
-                    'tra_type': tra_type,
-                    'acct': acct,
-                    'cat': cat,
-                    'merch': merch
-                }
-                print(new_tra)  # Equivalent to `debug` in Ruby
-                tra_batch.append(new_tra)
-
-            total_transactions += tra_batch
-            print(f"total transactions: {len(total_transactions)}, last date: {tra_batch[-1]['date']}")
-
-            page_info = resp['data']['prime']['transactionsHub']['transactionPage']['pageInfo']
-            cursor = page_info['endCursor']
-            has_next_page = page_info['hasNextPage']
-
-    print("done")
-
+    # Log the time taken to extract the transactions
+    duration = datetime.now() - start_tmstp
+    duration_str = f"{duration.seconds // 60} minutes, {duration.seconds % 60} seconds" if duration.seconds > 60 else f"{duration.seconds} seconds"
+    print(f"Transaction data extraction duration: {duration_str}")
 
 
 if __name__ == "__main__":
